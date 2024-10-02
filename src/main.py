@@ -1,42 +1,60 @@
 # src/main.py
 
-from src.data.data_collection import fetch_historical_token_data
-from src.data.data_preprocessing import clean_data, preprocess_data
-from src.data.feature_engineering import add_target_label, add_custom_features
-from src.models.train import prepare_data, train_model, save_model
-from src.models.evaluate import evaluate_model
+from utils.config import load_config
+from data.data_collection import load_token_list, fetch_historical_token_data
+from analysis.pattern_recognition import analyze_patterns
+from visualization.pattern_visualization import plot_cluster_characteristics, plot_pre_event_windows
+import pandas as pd
+import logging
 
 def main():
-    # Provide a list of token addresses you want to analyze
-    token_addresses = [
-        'token_address_1',
-        'token_address_2',
-        # Add more token addresses
-    ]
+    config = load_config()
+    api_key = config['api_keys']['birdeye']
+    print(f"API Key: {api_key[:4]}...{api_key[-4:]}")
+    
+    print("Step 1: Data Collection")
+    token_addresses = load_token_list()
+    print(f"Loaded tokens: {token_addresses}")
 
-    # Fetch and prepare data
-    df = fetch_historical_token_data(token_addresses)
-    if df.empty:
-        print("No data fetched. Exiting.")
-        return
+    historical_df, pre_event_windows = fetch_historical_token_data(token_addresses, chain='solana', interval='1m', api_key=api_key)
 
-    df = clean_data(df)
-    df = preprocess_data(df)
-    df = df.sort_values(by=['token_address', 'timestamp']).reset_index(drop=True)
-    df = add_custom_features(df)
-    df = add_target_label(df)
-
-    # Prepare data for training
-    X_train, X_test, y_train, y_test = prepare_data(df)
-
-    # Train model
-    model = train_model(X_train, y_train)
-
-    # Save model
-    save_model(model, 'models/saved_models/xgboost_model.pkl')
-
-    # Evaluate model
-    evaluate_model(model, X_test, y_test)
+    if not historical_df.empty:
+        print("\nData collection successful!")
+        print(f"Total number of data points: {len(historical_df)}")
+        print(f"Number of unique tokens: {historical_df['address'].nunique()}")
+        
+        # Basic analysis
+        for address in historical_df['address'].unique():
+            token_data = historical_df[historical_df['address'] == address]
+            print(f"\nToken: {address}")
+            print(f"  Number of data points: {len(token_data)}")
+            print(f"  Date range: from {token_data['datetime'].min()} to {token_data['datetime'].max()}")
+            print(f"  Price range: {token_data['value'].min():.8f} to {token_data['value'].max():.8f}")
+            
+            logging.warning(f"Unexpected date range for {address}: {token_data['datetime'].min()} to {token_data['datetime'].max()}")
+        
+        # Step 2: Pattern Recognition
+        print("\nStep 2: Pattern Recognition")
+        if pre_event_windows:
+            event_clusters, cluster_characteristics, common_patterns = analyze_patterns(pre_event_windows)
+            print(f"Identified {len(set(event_clusters))} distinct patterns in the pre-event windows")
+            
+            # Print common patterns
+            print("\nCommon Patterns Identified:")
+            for pattern in common_patterns:
+                print(f"- {pattern}")
+            
+            # Visualize the patterns
+            plot_cluster_characteristics(cluster_characteristics)
+            plot_pre_event_windows(pre_event_windows)
+            
+            print("\nVisualization complete. Check 'cluster_characteristics.png' and 'pre_event_windows.png' for visual representations of the patterns.")
+        else:
+            print("No 5x increase events detected for pattern analysis")
+        
+        # Here you can add more analysis or visualization code
+    else:
+        print("No historical data fetched or all data was invalid. Please check your data source and processing logic.")
 
 if __name__ == '__main__':
     main()

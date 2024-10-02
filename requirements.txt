@@ -7,3 +7,6 @@ xgboost
 requests
 PyYAML
 joblib
+imbalanced-learn
+pandas_ta
+seaborn

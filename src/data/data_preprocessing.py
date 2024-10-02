@@ -1,32 +1,50 @@
 # src/data/data_preprocessing.py
 
 import pandas as pd
+import numpy as np
 
 def clean_data(df):
     """
-    Clean the DataFrame by removing duplicates and handling missing values.
+    Perform data cleaning tasks.
+
+    Parameters:
+    - df (DataFrame): The raw data DataFrame.
+
+    Returns:
+    - DataFrame: The cleaned data.
     """
+    # Remove duplicates
     df = df.drop_duplicates()
-    df = df.dropna(subset=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+    # Handle missing values
+    df = df.dropna(subset=['price'])
+
+    # Fill missing volume and liquidity with zeros if necessary
+    df['volume'] = df['volume'].fillna(0)
+    df['liquidity'] = df['liquidity'].fillna(0)
+
+    # Reset index
+    df = df.reset_index(drop=True)
+
     return df
 
 def preprocess_data(df):
     """
-    Perform additional preprocessing steps specific to high-frequency data.
+    Perform data preprocessing tasks.
+
+    Parameters:
+    - df (DataFrame): The cleaned data DataFrame.
+
+    Returns:
+    - DataFrame: The preprocessed data.
     """
-    # Convert data types
-    numeric_fields = ['open', 'high', 'low', 'close', 'volume']
-    for field in numeric_fields:
-        df[field] = pd.to_numeric(df[field], errors='coerce')
+    # Sort data by token and timestamp
+    df = df.sort_values(by=['token_address', 'timestamp']).reset_index(drop=True)
 
-    # Handle missing or zero values
-    df = df.fillna(0)
-    df = df[df['close'] > 0]
+    # Calculate returns
+    df['return'] = df.groupby('token_address')['price'].pct_change()
 
-    # Ensure timestamp is datetime
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-    # Sort by timestamp
-    df = df.sort_values(by='timestamp')
+    # Handle any remaining missing values
+    df = df.dropna()
 
     return df

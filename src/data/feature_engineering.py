@@ -2,70 +2,77 @@
 
 import pandas as pd
 import numpy as np
-
-def add_target_label(df):
-    """
-    Add a binary target label indicating whether a 500% price increase occurs within the next 15 minutes.
-
-    Parameters:
-    - df (DataFrame): The input DataFrame with high-frequency data.
-
-    Returns:
-    - DataFrame: DataFrame with the 'success_label' column added.
-    """
-    df = df.copy()
-
-    # For each row, calculate the maximum future price within the next 15 minutes
-    window_size = 15  # Number of minutes
-    df['future_max_price'] = df['close'].rolling(window=window_size, min_periods=1).max().shift(-1)
-
-    # Calculate the percentage price increase from the current close to the future max price
-    df['price_increase'] = ((df['future_max_price'] - df['close']) / df['close']) * 100
-
-    # Create the success label where the price increase is at least 500%
-    df['success_label'] = (df['price_increase'] >= 500).astype(int)
-
-    # Clean up temporary columns
-    df = df.drop(columns=['future_max_price', 'price_increase'])
-
-    return df
-
-
+import pandas_ta as ta
 
 def add_custom_features(df):
     """
-    Add custom features that might be predictive of a big price move within the next 15 minutes.
+    Add custom features to the DataFrame.
+
+    Parameters:
+    - df (DataFrame): The preprocessed data.
+
+    Returns:
+    - DataFrame: The data with additional features.
     """
-    df = df.copy()
-    # Example technical indicators
-    df['return'] = df['close'].pct_change()
-    df['volatility'] = df['return'].rolling(window=5).std()  # Shorter window
-    df['volume_change'] = df['volume'].pct_change()
-    df['price_volume_corr'] = df['close'].rolling(window=5).corr(df['volume'])
-    
-    # Lag features
-    for lag in range(1, 6):
-        df[f'close_lag_{lag}'] = df['close'].shift(lag)
-        df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
-    
-    # Moving averages
-    df['ma_3'] = df['close'].rolling(window=3).mean()
-    df['ma_5'] = df['close'].rolling(window=5).mean()
-    df['ma_10'] = df['close'].rolling(window=10).mean()
-    
-    # Exponential moving averages
-    df['ema_3'] = df['close'].ewm(span=3, adjust=False).mean()
-    df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
-    
-    # RSI with a shorter window
-    delta = df['close'].diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    avg_gain = up.rolling(window=7).mean()
-    avg_loss = down.rolling(window=7).mean()
-    rs = avg_gain / avg_loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+    # Ensure data is sorted by token and timestamp
+    df = df.sort_values(by=['token_address', 'timestamp']).reset_index(drop=True)
+
+    # Group by token address
+    grouped = df.groupby('token_address')
+
+    # Add moving averages and volatility
+    df['ma_5'] = grouped['price'].transform(lambda x: x.rolling(window=5).mean())
+    df['ma_10'] = grouped['price'].transform(lambda x: x.rolling(window=10).mean())
+    df['volatility'] = grouped['return'].transform(lambda x: x.rolling(window=10).std())
+
+    # Add Relative Strength Index (RSI)
+    df['rsi'] = grouped.apply(lambda x: x.ta.rsi(length=14)).reset_index(level=0, drop=True)
+
+    # Add Moving Average Convergence Divergence (MACD)
+    macd = grouped.apply(lambda x: x.ta.macd()).reset_index(level=0, drop=True)
+    df = pd.concat([df, macd], axis=1)
+
+    # Drop rows with NaN values resulting from calculations
+    df = df.dropna()
+
     return df
 
+def add_target_label(df):
+    """
+    Add a target label to the DataFrame based on 5x price increases within 15 minutes.
+
+    Parameters:
+    - df (DataFrame): The data with features.
+
+    Returns:
+    - DataFrame: The data with a target label.
+    """
+    # Ensure data is sorted by token and timestamp
+    df = df.sort_values(by=['token_address', 'timestamp']).reset_index(drop=True)
+
+    # Define the time window (15 minutes)
+    time_window = pd.Timedelta(minutes=15)
+
+    # Initialize target column
+    df['target'] = 0
+
+    # Group by token
+    for token, group in df.groupby('token_address'):
+        group = group.reset_index(drop=True)
+        prices = group['price'].values
+        timestamps = group['timestamp']
+
+        for i in range(len(group)):
+            current_price = prices[i]
+            current_time = timestamps.iloc[i]
+
+            # Find future timestamps within 15 minutes
+            future_mask = (timestamps > current_time) & (timestamps <= current_time + time_window)
+            future_prices = prices[future_mask.index]
+
+            if len(future_prices) > 0:
+                max_future_price = future_prices.max()
+                if max_future_price >= 5 * current_price:
+                    df.loc[group.index[i], 'target'] = 1
+
+    return df
