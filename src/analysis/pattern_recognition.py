@@ -43,4 +43,15 @@ def identify_common_patterns(cluster_characteristics):
         # Add more pattern identification logic here
     return common_patterns
 
+def compute_features(df):
+    df['price_change'] = df['close'].pct_change()
+    if 'volume' in df.columns and df['volume'].sum() > 0:
+        df['volume_change'] = df['volume'].pct_change()
+        df['price_volume_ratio'] = df['close'] / df['volume'].replace(0, 1)
+    else:
+        df['volume_change'] = 0
+        df['price_volume_ratio'] = 0
+    # Add more features as needed
+    return df
+
 # You can add more functions for pattern analysis here

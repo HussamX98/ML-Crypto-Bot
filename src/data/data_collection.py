@@ -4,25 +4,34 @@ import requests
 import pandas as pd
 import yaml
 import time
-import datetime
-import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 
 def compute_features(df):
-    df['price_change_5m'] = df['value'].pct_change(5)
-    df['price_change_15m'] = df['value'].pct_change(15)
-    df['volume_change'] = df['volume'].pct_change()
-    df['volatility'] = df['value'].rolling(15).std()
+    df['price_change'] = df['close'].pct_change()
+    df['price_change_5m'] = df['close'].pct_change(5)
+    df['price_change_15m'] = df['close'].pct_change(15)
+    df['price_change_1h'] = df['close'].pct_change(60)
+    
+    if 'volume' in df.columns and df['volume'].sum() > 0:
+        df['volume_change'] = df['volume'].pct_change()
+        df['price_volume_ratio'] = df['close'] / df['volume'].replace(0, 1)
+    else:
+        df['volume_change'] = 0
+        df['price_volume_ratio'] = 0
+    
     return df
 
 def load_config():
     """
     Load configuration settings from config/config.yaml.
     """
-    with open('config/config.yaml', 'r') as file:
+    # Get the absolute path to the config directory
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'config.yaml')
+    with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
     return config
 
@@ -33,225 +42,132 @@ def load_token_list():
     Returns:
     - List: Contains token addresses.
     """
-    with open('config/token_list.yaml', 'r') as file:
+    # Get the absolute path to the token_list.yaml file
+    token_list_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'token_list.yaml')
+    with open(token_list_path, 'r') as file:
         token_list = yaml.safe_load(file)
     return token_list.get('tokens', [])
 
-def fetch_historical_price_data(token_address, chain='solana'):
-    """
-    Fetch historical price data for a specific token, including volume and liquidity if available.
-
-    Parameters:
-    - token_address (str): The address of the token.
-    - chain (str): The blockchain network (default 'solana').
-
-    Returns:
-    - DataFrame: Contains historical price data for the token.
-    """
-    config = load_config()
-    api_key = config['api_keys'].get('birdeye')
-
-    url = 'https://public-api.birdeye.so/defi/history_price'
-
+def fetch_token_history(address, start_time, end_time, chain, interval, api_key):
+    url = f"https://public-api.birdeye.so/defi/ohlcv?address={address}&type={interval}&time_from={start_time}&time_to={end_time}"
     headers = {
-        'accept': 'application/json',
-        'x-api-key': api_key,
-        'x-chain': chain,
-    }
-
-    # Define the time range for historical data (e.g., last 7 days)
-    end_time = int(time.time())
-    start_time = end_time - 7 * 24 * 60 * 60  # 7 days ago
-
-    params = {
-        'address': token_address,
-        'address_type': 'token',
-        'type': '1m',  # 1-minute intervals if available
-        'time_from': start_time,
-        'time_to': end_time,
+        "X-API-KEY": api_key,
+        "accept": "application/json",
+        "x-chain": chain
     }
 
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers)
+        print(f"API response status for token {address}: {response.status_code}")
         response.raise_for_status()
         data = response.json()
 
-        prices = data.get('data', [])
-
-        if not prices:
-            print(f"No price data found for token {token_address}.")
+        if 'data' not in data or 'items' not in data['data'] or not data['data']['items']:
+            logging.warning(f"No data available for token {address}")
             return pd.DataFrame()
 
-        # Convert to DataFrame
-        df = pd.DataFrame(prices)
+        # Create DataFrame from the 'items' list
+        df = pd.DataFrame(data['data']['items'])
+        # 'address' is already included in the data
 
-        # Rename columns based on actual response fields
-        # Adjust according to actual response
-        # Assuming 't' for timestamp, 'c' for price, 'v' for volume, 'l' for liquidity
-        df.rename(columns={'t': 'timestamp', 'c': 'price', 'v': 'volume', 'l': 'liquidity'}, inplace=True)
+        # Rename columns to standardize the DataFrame
+        df.rename(columns={
+            'unixTime': 'timestamp',
+            'c': 'close',
+            'o': 'open',
+            'h': 'high',
+            'l': 'low',
+            'v': 'volume',
+            # 'lq': 'liquidity'  # Include if 'lq' exists in the response
+        }, inplace=True)
 
-        # Convert timestamp to datetime
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        # Convert 'timestamp' to datetime
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+        df = df.sort_values('datetime').drop_duplicates()
 
-        # Convert price, volume, and liquidity to numeric
-        df['price'] = pd.to_numeric(df['price'], errors='coerce')
-        df['volume'] = pd.to_numeric(df.get('volume', pd.Series()), errors='coerce')
-        df['liquidity'] = pd.to_numeric(df.get('liquidity', pd.Series()), errors='coerce')
+        # Ensure numeric data types
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df['volume'] = pd.to_numeric(df.get('volume', pd.Series(0)), errors='coerce')
 
-        # Sort by timestamp
-        df = df.sort_values('timestamp')
+        # Replace NaN values in 'volume' column
+        df['volume'] = df['volume'].fillna(0)
 
-        return df
+        # Data validation and cleaning
+        df = df[df['datetime'] <= datetime.now(timezone.utc)]
+        df = df[df['close'] > 0]
+        df.dropna(subset=['close'], inplace=True)
+
+        # Add the token address to the DataFrame
+        df['address'] = address
+
+        return compute_features(df)
 
     except requests.exceptions.HTTPError as http_err:
-        print(f"HTTP error occurred for token {token_address}: {http_err}")
-        print(f"Response content: {response.content}")
+        logging.error(f"HTTP error occurred for token {address}: {http_err}")
         return pd.DataFrame()
     except Exception as e:
-        print(f"Error fetching price data for token {token_address}: {e}")
+        logging.error(f"Error fetching data for token {address}: {e}")
         return pd.DataFrame()
 
-def fetch_holders_data(token_address, chain='solana'):
-    """
-    Fetch the number of holders for a specific token.
-
-    Parameters:
-    - token_address (str): The address of the token.
-    - chain (str): The blockchain network.
-
-    Returns:
-    - int: Number of holders.
-    """
-    # Example using Solana Explorer API (adjust for actual API)
-    url = f'https://public-api.solscan.io/token/holders?tokenAddress={token_address}'
-
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-
-        holders = data.get('total', 0)
-        return holders
-
-    except Exception as e:
-        print(f"Error fetching holders data for token {token_address}: {e}")
-        return None
-
-def fetch_historical_token_data(token_addresses, chain='solana', interval='1m', api_key=None):
+def fetch_historical_token_data(token_addresses, chain='solana', interval='15m', api_key=None):
     all_token_data = []
-    pre_event_windows = []
-    
-    end_time = int(datetime.now().timestamp())
-    # Fetch data for the last 30 days
-    start_time = int((datetime.now() - timedelta(days=30)).timestamp())
-    
+    end_time = int(datetime.now(timezone.utc).timestamp())
+    start_time = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp())  # Fetch last 30 days of data
+
     for address in token_addresses:
+        print(f"Fetching data for token: {address}")
         try:
-            logging.info(f"Fetching data for token: {address}")
-            
-            url = "https://public-api.birdeye.so/defi/history_price"
-            
-            params = {
-                "address": address,
-                "address_type": "token",
-                "type": interval,
-                "time_from": start_time,
-                "time_to": end_time
-            }
-            
-            headers = {
-                "X-API-KEY": api_key,
-                "accept": "application/json"
-            }
-            
-            try:
-                response = requests.get(url, params=params, headers=headers)
-                response.raise_for_status()
-                
-                data = response.json()
-                
-                if 'data' in data and 'items' in data['data'] and len(data['data']['items']) > 0:
-                    df = pd.DataFrame(data['data']['items'])
-                    df['address'] = address
-                    df['unixTime'] = df['unixTime'].apply(correct_timestamp)
-                    df['datetime'] = pd.to_datetime(df['unixTime'], unit='s', utc=True)
-                    
-                    if 'volume' not in df.columns:
-                        print(f"Warning: Volume data missing for token {address}. Using placeholder values.")
-                        df['volume'] = 0  # or some other placeholder value
-                    
-                    # Compute features
-                    df = compute_features(df)
-                    
-                    # Detect 5x price increases within 15 minutes
-                    df['price_ratio'] = df['value'] / df['value'].shift(15)  # 15 periods of 1 minute = 15 minutes
-                    five_x_increases = df[df['price_ratio'] >= 5]
-                    
-                    if not five_x_increases.empty:
-                        print(f"Detected {len(five_x_increases)} instances of 5x price increase within 15 minutes for {address}")
-                        for _, row in five_x_increases.iterrows():
-                            print(f"  5x increase at {row['datetime']}: {row['value']/row['price_ratio']:.8f} to {row['value']:.8f}")
-                        
-                        # Extract pre-event windows
-                        def extract_pre_event_window(df, event_time, window_minutes=60):
-                            return df[(df['datetime'] >= event_time - pd.Timedelta(minutes=window_minutes)) & 
-                                      (df['datetime'] < event_time)]
-                        
-                        for _, row in five_x_increases.iterrows():
-                            window = extract_pre_event_window(df, row['datetime'])
-                            pre_event_windows.append(window)
-                    
-                    all_token_data.append(df)
-                    logging.info(f"Processed {len(df)} data points for token {address}")
-                    print(f"Data collected for token {address}: {len(df)} data points")
-                    print(f"Date range for {address}: from {df['datetime'].min()} to {df['datetime'].max()}")
-                else:
-                    print(f"No data available for token {address}")
-                    print(f"API Response: {data}")
-            
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching price data for token {address}: {e}")
-                print(f"Response content: {response.content}")
-            except KeyError as e:
-                print(f"Error processing data for token {address}: {e}")
-                print(f"API Response: {data}")
+            token_data = fetch_token_history(address, start_time, end_time, chain, interval, api_key)
+            if not token_data.empty:
+                print(f"Data fetched for token {address}:")
+                print(token_data.head())
+                all_token_data.append(token_data)
+            else:
+                print(f"No data returned for token: {address}")
+            time.sleep(1)  # Add a delay to avoid hitting rate limits
         except Exception as e:
-            print(f"Error processing data for token {address}: {e}")
-            continue  # Skip to the next token instead of breaking the loop
-    
+            logging.error(f"Error fetching data for token {address}: {str(e)}")
+
     if all_token_data:
-        result_df = pd.concat(all_token_data, ignore_index=True)
-        print(f"\nTotal data points collected: {len(result_df)}")
-        print(f"Overall date range: from {result_df['datetime'].min()} to {result_df['datetime'].max()}")
-        return result_df, pre_event_windows
+        historical_df = pd.concat(all_token_data, ignore_index=True)
+        events_1440min = detect_5x_events(historical_df, window_minutes=1440, min_volume=10000)
+        events_60min = detect_5x_events(historical_df, window_minutes=60, min_volume=10000)
+        events_15min = detect_5x_events(historical_df, window_minutes=15, min_volume=10000)
+        events_5min = detect_5x_events(historical_df, window_minutes=5, min_volume=10000)
+        return historical_df, events_1440min, events_60min, events_15min, events_5min
     else:
-        print("No data collected for any tokens.")
-        return pd.DataFrame(), []
+        logging.warning("No historical data fetched for any token.")
+        return pd.DataFrame(), [], [], [], []
 
-def correct_timestamp(unix_time):
-    current_time = int(time.time())
-    time_difference = max(unix_time - current_time, 0)
-    return current_time - time_difference
+def detect_5x_events(df, window_minutes=15, min_volume=10000):
+    events = []
+    for address, token_data in df.groupby('address'):
+        token_data = token_data.sort_values('datetime').reset_index(drop=True)
+        
+        window_size = pd.Timedelta(minutes=window_minutes)
+        
+        for i in range(len(token_data)):
+            start_time = token_data.loc[i, 'datetime']
+            end_time = start_time + window_size
 
-def validate_data(df):
-    current_time = int(time.time())
-    if df['unixTime'].max() > current_time:
-        logging.warning(f"Future dates detected for token {df['address'].iloc[0]}")
-    if df['value'].min() < 0:
-        logging.warning(f"Negative prices detected for token {df['address'].iloc[0]}")
-    return df
+            window_data = token_data[(token_data['datetime'] >= start_time) & (token_data['datetime'] <= end_time)]
+            
+            if len(window_data) > 1:
+                start_price = window_data.iloc[0]['close']
+                max_price = window_data['close'].max()
+                max_price_index = window_data['close'].idxmax()
+                end_time = window_data.loc[max_price_index, 'datetime']
+                total_volume = window_data['volume'].sum()
 
-if __name__ == '__main__':
-    # Load token list from token_list.yaml
-    print("Loading token list from token_list.yaml...")
-    token_addresses = load_token_list()
-    print(f"Loaded tokens: {token_addresses}")
-
-    # Fetch historical data for selected tokens
-    print("Fetching historical data for selected tokens...")
-    historical_df = fetch_historical_token_data(token_addresses, chain='solana')
-    if historical_df.empty:
-        print("No historical data fetched. Exiting.")
-        exit()
-    else:
-        print("Historical data fetched successfully.")
+                if max_price >= 5 * start_price and total_volume >= min_volume:
+                    events.append({
+                        'address': address,
+                        'start_time': start_time,
+                        'end_time': end_time,
+                        'start_price': start_price,
+                        'end_price': max_price,
+                        'increase_factor': max_price / start_price,
+                        'window_size': window_minutes,
+                        'total_volume': total_volume
+                    })
+    return events
